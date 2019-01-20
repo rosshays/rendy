@@ -26,6 +26,18 @@ wsi = ["rendy-wsi"]
 full = ["graph", "mesh", "texture", "shader"]
 default = ["full"]
 
+[[example]]
+name = "init"
+path = "examples/init/main.rs"
+
+[[example]]
+name = "quads"
+path = "examples/quads/main.rs"
+
+[[example]]
+name = "triangle"
+path = "examples/triangle/main.rs"
+
 [dependencies]
 rendy-command = { path = "../command", optional = true }
 rendy-factory = { path = "../factory", optional = true }
