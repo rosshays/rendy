@@ -2,14 +2,17 @@ use std::cmp::min;
 
 use crate::{
     command::FamilyId,
-    memory::{LinearConfig, DynamicConfig, HeapsConfig},
+    memory::{DynamicConfig, HeapsConfig, LinearConfig},
 };
 
 /// Factory initialization config.
 #[derive(Clone, derivative::Derivative)]
 #[derivative(Debug, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Config<H = BasicHeapsConfigure, Q = OneGraphicsQueue> {
+pub struct Config<D = BasicDevicesConfigure, H = BasicHeapsConfigure, Q = OneGraphicsQueue> {
+    /// Config to choose adapter.
+    pub devices: D,
+
     /// Config for memory::Heaps.
     pub heaps: H,
 
@@ -38,7 +41,10 @@ pub struct OneGraphicsQueue;
 unsafe impl QueuesConfigure for OneGraphicsQueue {
     type Priorities = [f32; 1];
     type Families = Option<(FamilyId, [f32; 1])>;
-    fn configure(self, families: &[impl gfx_hal::queue::QueueFamily]) -> Option<(FamilyId, [f32; 1])> {
+    fn configure(
+        self,
+        families: &[impl gfx_hal::queue::QueueFamily],
+    ) -> Option<(FamilyId, [f32; 1])> {
         families
             .iter()
             .find(|f| f.supports_graphics() && f.max_queues() > 0)
@@ -87,7 +93,9 @@ unsafe impl HeapsConfigure for BasicHeapsConfigure {
         self,
         properties: &gfx_hal::adapter::MemoryProperties,
     ) -> (Self::Types, Self::Heaps) {
-        let types = properties.memory_types.iter()
+        let types = properties
+            .memory_types
+            .iter()
             .map(|mt| {
                 let config = HeapsConfig {
                     linear: if mt
@@ -117,11 +125,10 @@ unsafe impl HeapsConfigure for BasicHeapsConfigure {
                 };
 
                 (mt.properties, mt.heap_index as u32, config)
-            }).collect();
-
-        let heaps = properties.memory_heaps.iter()
-            .cloned()
+            })
             .collect();
+
+        let heaps = properties.memory_heaps.iter().cloned().collect();
 
         (types, heaps)
     }
@@ -144,5 +151,43 @@ unsafe impl HeapsConfigure for SavedHeapsConfig {
         _properties: &gfx_hal::adapter::MemoryProperties,
     ) -> (Self::Types, Self::Heaps) {
         (self.types, self.heaps)
+    }
+}
+
+/// Devices configuration.
+pub trait DevicesConfigure {
+    /// Pick adapter from the slice.
+    ///
+    /// # Panics
+    ///
+    /// This function may panic if empty slice is provided.
+    ///
+    fn pick<B>(&self, adapters: &[gfx_hal::Adapter<B>]) -> usize
+    where
+        B: gfx_hal::Backend;
+}
+
+/// Basics adapters config.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct BasicDevicesConfigure;
+
+impl DevicesConfigure for BasicDevicesConfigure {
+    fn pick<B>(&self, adapters: &[gfx_hal::Adapter<B>]) -> usize
+    where
+        B: gfx_hal::Backend,
+    {
+        adapters
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, adapter)| match adapter.info.device_type {
+                gfx_hal::adapter::DeviceType::DiscreteGpu => 0,
+                gfx_hal::adapter::DeviceType::IntegratedGpu => 1,
+                gfx_hal::adapter::DeviceType::VirtualGpu => 2,
+                gfx_hal::adapter::DeviceType::Cpu => 3,
+                _ => 4,
+            })
+            .expect("No adapters present")
+            .0
     }
 }

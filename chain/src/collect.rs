@@ -141,7 +141,8 @@ where
                 .map(|(index, &node)| {
                     let (fitness, qid) = fitness(node, &mut images, &mut buffers, &mut schedule);
                     (fitness, qid, index)
-                }).min()
+                })
+                .min()
                 .unwrap();
 
             let node = ready_nodes.swap_remove(index);
@@ -357,6 +358,7 @@ fn schedule_node<'a>(
             sid,
             submission,
             state,
+            |s, i, l| s.set_buffer_link(i, l),
         );
     }
     for &(id, state) in &node.images {
@@ -367,6 +369,7 @@ fn schedule_node<'a>(
             sid,
             submission,
             state,
+            |s, i, l| s.set_image_link(i, l),
         );
     }
 
@@ -385,6 +388,7 @@ fn add_to_chain<R, S>(
     sid: SubmissionId,
     submission: &mut Submission<S>,
     state: State<R>,
+    set_link: impl FnOnce(&mut Submission<S>, Id, usize),
 ) where
     R: Resource,
 {
@@ -400,12 +404,12 @@ fn add_to_chain<R, S>(
     let chain_len = chain.links().len();
     let append = match chain.last_link_mut() {
         Some(ref mut link) if link.compatible(&node) => {
-            submission.set_link(id, chain_len - 1);
+            set_link(submission, id, chain_len - 1);
             link.add_node(node);
             None
         }
         Some(_) | None => {
-            submission.set_link(id, chain_len);
+            set_link(submission, id, chain_len);
             chain_data.last_link_wait_factor = chain_data.current_link_wait_factor;
             Some(Link::new(node))
         }

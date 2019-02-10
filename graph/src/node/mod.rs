@@ -1,18 +1,16 @@
 //! Defines node - building block for framegraph.
 //!
 
-pub mod render;
 pub mod present;
+pub mod render;
 
 use crate::{
     chain,
-    command::{Capability, Family, Supports, Submission, Submittable, FamilyId},
+    command::{Capability, Family, FamilyId, Fence, QueueId, Submission, Submittable, Supports},
     factory::Factory,
     frame::Frames,
     resource::{Buffer, Image},
-    BufferId,
-    ImageId,
-    NodeId,
+    BufferId, ImageId, NodeId,
 };
 
 /// Buffer access node will perform.
@@ -44,13 +42,15 @@ pub struct BufferBarrier {
     pub families: Option<std::ops::Range<FamilyId>>,
 }
 
-
 /// Buffer shared between nodes.
-/// 
+///
 /// If Node doesn't actually use the buffer it can merge acquire and release barriers into one.
 /// TODO: Make merge function.
 #[derive(Debug)]
 pub struct NodeBuffer<'a, B: gfx_hal::Backend> {
+    /// Id of the buffer.
+    pub id: BufferId,
+
     /// Buffer reference.
     pub buffer: &'a mut Buffer<B>,
 
@@ -68,6 +68,20 @@ pub struct NodeBuffer<'a, B: gfx_hal::Backend> {
     pub release: Option<BufferBarrier>,
 }
 
+impl<'a, B> NodeBuffer<'a, B>
+where
+    B: gfx_hal::Backend,
+{
+    fn reborrow(&mut self) -> NodeBuffer<'_, B> {
+        NodeBuffer {
+            id: self.id,
+            buffer: &mut self.buffer,
+            range: self.range.clone(),
+            acquire: self.acquire.clone(),
+            release: self.release.clone(),
+        }
+    }
+}
 
 /// Image access node wants to perform.
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +121,9 @@ pub struct ImageBarrier {
 /// Image shared between nodes.
 #[derive(Debug)]
 pub struct NodeImage<'a, B: gfx_hal::Backend> {
+    /// Id of the image.
+    pub id: ImageId,
+
     /// Image reference.
     pub image: &'a mut Image<B>,
 
@@ -128,6 +145,23 @@ pub struct NodeImage<'a, B: gfx_hal::Backend> {
     /// Node implementation must insert it after last command that uses the image.
     /// Barrier must be inserted even if this node doesn't use the image.
     pub release: Option<ImageBarrier>,
+}
+
+impl<'a, B> NodeImage<'a, B>
+where
+    B: gfx_hal::Backend,
+{
+    fn reborrow(&mut self) -> NodeImage<'_, B> {
+        NodeImage {
+            id: self.id,
+            image: &mut self.image,
+            range: self.range.clone(),
+            layout: self.layout,
+            clear: self.clear,
+            acquire: self.acquire.clone(),
+            release: self.release.clone(),
+        }
+    }
 }
 
 /// NodeSubmittable
@@ -159,7 +193,7 @@ pub trait Node<B: gfx_hal::Backend, T: ?Sized>:
     type Desc: NodeDesc<B, T, Node = Self>;
 
     /// Desc creation.
-    /// Convenient method if builder implements `Default`.
+    /// Convenient method if `Self::Desc` implements `Default`.
     fn desc() -> Self::Desc
     where
         Self::Desc: Default,
@@ -168,7 +202,7 @@ pub trait Node<B: gfx_hal::Backend, T: ?Sized>:
     }
 
     /// Builder creation.
-    fn builder() -> NodeBuilder<B, T>
+    fn builder() -> DescBuilder<B, T, Self::Desc>
     where
         Self::Desc: Default,
     {
@@ -185,14 +219,14 @@ pub trait Node<B: gfx_hal::Backend, T: ?Sized>:
     ) -> <Self as NodeSubmittable<'a, B>>::Submittables;
 
     /// Dispose of the node.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// Must be called after waiting for device idle.
     unsafe fn dispose(self, factory: &mut Factory<B>, aux: &mut T);
 }
 
-/// Builder of the node.
+/// Description of the node.
 /// Implementation of the builder type provide framegraph with static information about node
 /// that is used for building the node.
 pub trait NodeDesc<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug + Sized + 'static {
@@ -200,12 +234,13 @@ pub trait NodeDesc<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug + Sized + 's
     type Node: Node<B, T>;
 
     /// Make node builder.
-    fn builder(self) -> NodeBuilder<B, T> {
-        NodeBuilder {
-            desc: Box::new((self,)),
+    fn builder(self) -> DescBuilder<B, T, Self> {
+        DescBuilder {
+            desc: self,
             buffers: Vec::new(),
             images: Vec::new(),
             dependencies: Vec::new(),
+            marker: std::marker::PhantomData,
         }
     }
 
@@ -234,15 +269,13 @@ pub trait NodeDesc<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug + Sized + 's
         factory: &mut Factory<B>,
         aux: &mut T,
         family: FamilyId,
-        buffers: &mut [NodeBuffer<'a, B>],
-        images: &mut [NodeImage<'a, B>],
+        buffers: Vec<NodeBuffer<'a, B>>,
+        images: Vec<NodeImage<'a, B>>,
     ) -> Result<Self::Node, failure::Error>;
 }
 
 /// Trait-object safe `Node`.
-pub trait AnyNode<B: gfx_hal::Backend, T: ?Sized>:
-    std::fmt::Debug + Sync + Send
-{
+pub trait DynNode<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug + Sync + Send {
     /// Record commands required by node.
     /// Recorded buffers go into `submits`.
     unsafe fn run<'a>(
@@ -250,21 +283,21 @@ pub trait AnyNode<B: gfx_hal::Backend, T: ?Sized>:
         factory: &mut Factory<B>,
         aux: &mut T,
         frames: &Frames<B>,
-        qid: chain::QueueId,
+        qid: QueueId,
         waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
         signals: &[&'a B::Semaphore],
-        fence: Option<&B::Fence>,
+        fence: Option<&mut Fence<B>>,
     );
 
     /// Dispose of the node.
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// Must be called after waiting for device idle.
     unsafe fn dispose(self: Box<Self>, factory: &mut Factory<B>, aux: &mut T);
 }
 
-impl<B, T, N> AnyNode<B, T> for (N,)
+impl<B, T, N> DynNode<B, T> for (N,)
 where
     B: gfx_hal::Backend,
     T: ?Sized,
@@ -275,18 +308,18 @@ where
         factory: &mut Factory<B>,
         aux: &mut T,
         frames: &Frames<B>,
-        qid: chain::QueueId,
+        qid: QueueId,
         waits: &[(&'a B::Semaphore, gfx_hal::pso::PipelineStage)],
         signals: &[&'a B::Semaphore],
-        fence: Option<&B::Fence>,
+        fence: Option<&mut Fence<B>>,
     ) {
         let submittables = Node::run(&mut self.0, factory, aux, frames);
-        factory.family_mut(qid.family()).submit(
-            qid.index(),
+        factory.family_mut(qid.family()).queues_mut()[qid.index()].submit(
             Some(
-                Submission::new(submittables)
+                Submission::new()
+                    .submits(submittables)
                     .wait(waits.iter().cloned())
-                    .signal(signals.iter().cloned())
+                    .signal(signals.iter().cloned()),
             ),
             fence,
         )
@@ -297,95 +330,142 @@ where
     }
 }
 
-/// Trait-object safe `NodeDesc`.
-pub trait AnyNodeDesc<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug {
-    /// Find family suitable for the node.
+/// Dynamic ode builder that emits `DynNode`.
+pub trait NodeBuilder<B: gfx_hal::Backend, T: ?Sized>: std::fmt::Debug {
     fn family(&self, families: &[Family<B>]) -> Option<FamilyId>;
 
-    /// Get buffer resource states.
-    fn buffers(&self) -> Vec<BufferAccess> { Vec::new() }
+    /// Get buffer accessed by the node.
+    fn buffers(&self) -> Vec<(BufferId, BufferAccess)>;
 
-    /// Get image resource states.
-    fn images(&self) -> Vec<ImageAccess> { Vec::new() }
+    /// Get images accessed by the node.
+    fn images(&self) -> Vec<(ImageId, ImageAccess)>;
 
-    /// Build the node.
+    /// Indices of nodes this one dependes on.
+    fn dependencies(&self) -> Vec<NodeId>;
+
+    /// Build node.
     fn build<'a>(
         self: Box<Self>,
         factory: &mut Factory<B>,
         aux: &mut T,
         family: FamilyId,
-        buffers: &mut [NodeBuffer<'a, B>],
-        images: &mut [NodeImage<'a, B>],
-    ) -> Result<Box<dyn AnyNode<B, T>>, failure::Error>;
+        buffers: Vec<NodeBuffer<'a, B>>,
+        images: Vec<NodeImage<'a, B>>,
+    ) -> Result<Box<dyn DynNode<B, T>>, failure::Error>;
 
-    /// Make node builder.
-    fn builder(self) -> NodeBuilder<B, T>
-    where
-        Self: Sized + 'static,
-    {
-        NodeBuilder {
-            desc: Box::new(self),
-            buffers: Vec::new(),
-            images: Vec::new(),
-            dependencies: Vec::new(),
-        }
-    }
-}
-
-impl<B, T, N> AnyNodeDesc<B, T> for (N,)
-where
-    B: gfx_hal::Backend,
-    T: ?Sized,
-    N: NodeDesc<B, T>,
-{
-    fn family(&self, families: &[Family<B>]) -> Option<FamilyId> {
-        families
-            .iter()
-            .find(|family| {
-                Supports::<<N::Node as Node<B, T>>::Capability>::supports(&family.capability())
-                    .is_some()
-            }).map(|family| family.index())
-    }
-
-    fn buffers(&self) -> Vec<BufferAccess> {
-        N::buffers(&self.0)
-    }
-
-    fn images(&self) -> Vec<ImageAccess> {
-        N::images(&self.0)
-    }
-
-    fn build<'a>(
+    #[doc(hidden)]
+    fn build_impl<'a>(
         self: Box<Self>,
         factory: &mut Factory<B>,
         aux: &mut T,
         family: FamilyId,
-        buffers: &mut [NodeBuffer<'a, B>],
-        images: &mut [NodeImage<'a, B>],
-    ) -> Result<Box<dyn AnyNode<B, T>>, failure::Error> {
-        let node = NodeDesc::build(
-            &self.0,
-            factory,
-            aux,
-            family,
-            buffers,
-            images,
-        )?;
-        Ok(Box::new((node,)))
+        buffers: &'a mut [Option<Buffer<B>>],
+        images: &'a mut [Option<(Image<B>, Option<gfx_hal::command::ClearValue>)>],
+        chains: &chain::Chains,
+        submission: &chain::Submission<chain::SyncData<usize, usize>>,
+    ) -> Result<Box<dyn DynNode<B, T>>, failure::Error> {
+        let mut buffer_ids: Vec<_> = self.buffers().into_iter().map(|(id, _)| id).collect();
+        buffer_ids.sort();
+        buffer_ids.dedup();
+
+        let buffers: Vec<_> = buffer_ids
+            .into_iter()
+            .map(|id| {
+                let chain_id = chain::Id(id.0);
+                let sync = submission.sync();
+                let buffer = buffers
+                    .get_mut(id.0)
+                    .and_then(Option::as_mut)
+                    .expect("Buffer referenced from at least one node must be instantiated");
+                NodeBuffer {
+                    id,
+                    range: 0..buffer.size(),
+                    acquire: sync.acquire.buffers.get(&chain_id).map(
+                        |chain::Barrier { states, families }| BufferBarrier {
+                            states: states.start.0..states.end.0,
+                            stages: states.start.2..states.end.2,
+                            families: families.clone(),
+                        },
+                    ),
+                    release: sync.release.buffers.get(&chain_id).map(
+                        |chain::Barrier { states, families }| BufferBarrier {
+                            states: states.start.0..states.end.0,
+                            stages: states.start.2..states.end.2,
+                            families: families.clone(),
+                        },
+                    ),
+                    buffer: unsafe {
+                        // ids are unique.
+                        // Hence mutable references to different buffers will be acquired.
+                        std::mem::transmute::<_, &'a mut Buffer<B>>(buffer)
+                    },
+                }
+            })
+            .collect();
+
+        let mut image_ids: Vec<_> = self.images().into_iter().map(|(id, _)| id).collect();
+        image_ids.sort();
+        image_ids.dedup();
+
+        let images: Vec<_> = image_ids
+            .into_iter()
+            .map(|id| {
+                let chain_id = chain::Id(id.0);
+                let sync = submission.sync();
+                let link = submission.image_link_index(chain_id);
+                let (image, clear) = images
+                    .get_mut(id.0)
+                    .and_then(Option::as_mut)
+                    .expect("Image referenced from at least one node must be instantiated");
+                NodeImage {
+                    id,
+                    range: gfx_hal::image::SubresourceRange {
+                        aspects: image.format().surface_desc().aspects,
+                        levels: 0..image.levels(),
+                        layers: 0..image.layers(),
+                    },
+                    layout: chains.images[&chain_id].links()[link]
+                        .submission_state(submission.id())
+                        .layout,
+                    clear: if link == 0 { *clear } else { None },
+                    acquire: sync.acquire.images.get(&chain_id).map(
+                        |chain::Barrier { states, families }| ImageBarrier {
+                            states: (states.start.0, states.start.1)..(states.end.0, states.end.1),
+                            stages: states.start.2..states.end.2,
+                            families: families.clone(),
+                        },
+                    ),
+                    release: sync.release.images.get(&chain_id).map(
+                        |chain::Barrier { states, families }| ImageBarrier {
+                            states: (states.start.0, states.start.1)..(states.end.0, states.end.1),
+                            stages: states.start.2..states.end.2,
+                            families: families.clone(),
+                        },
+                    ),
+                    image: unsafe {
+                        // ids are unique.
+                        // Hence mutable references to different images will be acquired.
+                        std::mem::transmute::<_, &'a mut Image<B>>(image)
+                    },
+                }
+            })
+            .collect();
+        self.build(factory, aux, family, buffers, images)
     }
 }
 
 /// Builder for the node.
 #[derive(derivative::Derivative)]
-#[derivative(Debug(bound = ""))]
-pub struct NodeBuilder<B: gfx_hal::Backend, T: ?Sized> {
-    pub(crate) desc: Box<dyn AnyNodeDesc<B, T>>,
-    pub(crate) buffers: Vec<BufferId>,
-    pub(crate) images: Vec<ImageId>,
-    pub(crate) dependencies: Vec<usize>,
+#[derivative(Debug(bound = "N: std::fmt::Debug"))]
+pub struct DescBuilder<B: gfx_hal::Backend, T: ?Sized, N> {
+    desc: N,
+    buffers: Vec<BufferId>,
+    images: Vec<ImageId>,
+    dependencies: Vec<NodeId>,
+    marker: std::marker::PhantomData<fn(B, &T)>,
 }
 
-impl<B, T> NodeBuilder<B, T>
+impl<B, T, N> DescBuilder<B, T, N>
 where
     B: gfx_hal::Backend,
     T: ?Sized,
@@ -394,20 +474,6 @@ where
     /// This method must be called for each buffer node uses.
     pub fn add_buffer(&mut self, buffer: BufferId) -> &mut Self {
         self.buffers.push(buffer);
-        self
-    }
-
-    /// Add image to the node.
-    /// This method must be called for each image node uses.
-    pub fn add_image(&mut self, image: ImageId) -> &mut Self {
-        self.images.push(image);
-        self
-    }
-
-    /// Add dependency.
-    /// Node will be placed after its dependencies.
-    pub fn add_dependency(&mut self, dependency: NodeId) -> &mut Self {
-        self.dependencies.push(dependency.0);
         self
     }
 
@@ -420,8 +486,22 @@ where
 
     /// Add image to the node.
     /// This method must be called for each image node uses.
+    pub fn add_image(&mut self, image: ImageId) -> &mut Self {
+        self.images.push(image);
+        self
+    }
+
+    /// Add image to the node.
+    /// This method must be called for each image node uses.
     pub fn with_image(mut self, image: ImageId) -> Self {
         self.add_image(image);
+        self
+    }
+
+    /// Add dependency.
+    /// Node will be placed after its dependencies.
+    pub fn add_dependency(&mut self, dependency: NodeId) -> &mut Self {
+        self.dependencies.push(dependency);
         self
     }
 
@@ -431,196 +511,154 @@ where
         self.add_dependency(dependency);
         self
     }
+}
 
-    pub(crate) fn chain(&self, id: usize, factory: &Factory<B>, buffers: usize) -> chain::Node {
+impl<B, T, N> NodeBuilder<B, T> for DescBuilder<B, T, N>
+where
+    B: gfx_hal::Backend,
+    T: ?Sized,
+    N: NodeDesc<B, T>,
+{
+    fn family(&self, families: &[Family<B>]) -> Option<FamilyId> {
+        families
+            .iter()
+            .find(|family| {
+                Supports::<<N::Node as Node<B, T>>::Capability>::supports(&family.capability())
+                    .is_some()
+            })
+            .map(|family| family.id())
+    }
+
+    fn buffers(&self) -> Vec<(BufferId, BufferAccess)> {
         let desc_buffers = self.desc.buffers();
         assert_eq!(self.buffers.len(), desc_buffers.len());
 
+        self.buffers.iter().cloned().zip(desc_buffers).collect()
+    }
+
+    fn images(&self) -> Vec<(ImageId, ImageAccess)> {
         let desc_images = self.desc.images();
         assert_eq!(self.images.len(), desc_images.len());
 
-        chain::Node {
-            id,
-            family: self.desc.family(factory.families()).unwrap(),
-            dependencies: self.dependencies.clone(),
-            buffers: self
-                .buffers
-                .iter()
-                .map(|id| chain::Id(id.0))
-                .zip(desc_buffers)
-                .map(|(id, access)| {
-                    (id, chain::BufferState {
-                        access: access.access,
-                        stages: access.stages,
-                        layout: (),
-                        usage: access.usage,
-                    })
-                })
-                .collect(),
-            images: self
-                .images
-                .iter()
-                .map(|id| chain::Id(id.0 + buffers))
-                .zip(desc_images)
-                .map(|(id, access)| {
-                    (id, chain::ImageState {
-                        access: access.access,
-                        stages: access.stages,
-                        layout: access.layout,
-                        usage: access.usage,
-                    })
-                })
-                .collect(),
-        }
+        self.images.iter().cloned().zip(desc_images).collect()
     }
 
-    /// Build node from this.
-    #[allow(unused)]
-    pub(crate) fn build<'a>(
-        self,
+    fn dependencies(&self) -> Vec<NodeId> {
+        self.dependencies.clone()
+    }
+
+    fn build<'a>(
+        self: Box<Self>,
         factory: &mut Factory<B>,
         aux: &mut T,
         family: FamilyId,
-        buffers: &mut [Option<Buffer<B>>],
-        images: &mut [Option<(Image<B>, Option<gfx_hal::command::ClearValue>)>],
-        chains: &chain::Chains,
-        submission: &chain::Submission<chain::SyncData<usize, usize>>,
-    ) -> Result<Box<dyn AnyNode<B, T>>, failure::Error> {
-        let buffers_len = buffers.len();
-        self.desc.build(
-            factory,
-            aux,
-            family,
-            &mut self.buffers.iter().zip(buffers).map(|(&BufferId(index), resource)| {
-                let id = chain::Id(index);
-                let sync = submission.sync();
-                let buffer = resource.as_mut().expect("Buffer referenced from at least one node must be instantiated");
-                NodeBuffer {
-                    range: 0 .. buffer.size(),
-                    acquire: sync.acquire.buffers.get(&id).map(|chain::Barrier { states, families }| BufferBarrier {
-                        states: states.start.0 .. states.end.0,
-                        stages: states.start.2 .. states.end.2,
-                        families: families.clone(),
-                    }),
-                    release: sync.release.buffers.get(&id).map(|chain::Barrier { states, families }| BufferBarrier {
-                        states: states.start.0 .. states.end.0,
-                        stages: states.start.2 .. states.end.2,
-                        families: families.clone(),
-                    }),
-                    buffer,
-                }
-            }).collect::<Vec<_>>(),
-            &mut self.images.iter().zip(images).map(|(&ImageId(index), resource)| {
-                let id = chain::Id(index + buffers_len);
-                let sync = submission.sync();
-                let (image, clear) = resource.as_mut().expect("Image referenced from at least one node must be instantiated");
-                NodeImage {
-                    range: gfx_hal::image::SubresourceRange {
-                        aspects: image.format().surface_desc().aspects,
-                        levels: 0 .. image.levels(),
-                        layers: 0 .. image.layers(),
-                    },
-                    layout: chains.images[&id].links()[submission.resource_link_index(id)].submission_state(submission.id()).layout,
-                    clear: if submission.resource_link_index(id) == 0 {
-                        *clear
-                    } else {
-                        None
-                    },
-                    acquire: sync.acquire.images.get(&id).map(|chain::Barrier { states, families }| ImageBarrier {
-                        states: (states.start.0, states.start.1) .. (states.end.0, states.end.1),
-                        stages: states.start.2 .. states.end.2,
-                        families: families.clone(),
-                    }),
-                    release: sync.release.images.get(&id).map(|chain::Barrier { states, families }| ImageBarrier {
-                        states: (states.start.0, states.start.1) .. (states.end.0, states.end.1),
-                        stages: states.start.2 .. states.end.2,
-                        families: families.clone(),
-                    }),
-                    image,
-                }
-            }).collect::<Vec<_>>(),
-        )
+        buffers: Vec<NodeBuffer<'a, B>>,
+        images: Vec<NodeImage<'a, B>>,
+    ) -> Result<Box<dyn DynNode<B, T>>, failure::Error> {
+        Ok(Box::new((self
+            .desc
+            .build(factory, aux, family, buffers, images)?,)))
     }
 }
 
 /// Convert graph barriers into gfx barriers.
-pub fn gfx_acquire_barriers<'a, B: gfx_hal::Backend>(buffers: impl IntoIterator<Item = &'a NodeBuffer<'a, B>>, images: impl IntoIterator<Item = &'a NodeImage<'a, B>>) -> (std::ops::Range<gfx_hal::pso::PipelineStage>, Vec<gfx_hal::memory::Barrier<'a, B>>) {
+pub fn gfx_acquire_barriers<'a, B: gfx_hal::Backend>(
+    buffers: impl IntoIterator<Item = &'a NodeBuffer<'a, B>>,
+    images: impl IntoIterator<Item = &'a NodeImage<'a, B>>,
+) -> (
+    std::ops::Range<gfx_hal::pso::PipelineStage>,
+    Vec<gfx_hal::memory::Barrier<'a, B>>,
+) {
     let mut bstart = gfx_hal::pso::PipelineStage::empty();
     let mut bend = gfx_hal::pso::PipelineStage::empty();
 
     let mut istart = gfx_hal::pso::PipelineStage::empty();
     let mut iend = gfx_hal::pso::PipelineStage::empty();
 
-    let barriers: Vec<gfx_hal::memory::Barrier<'_, B>> = buffers.into_iter().filter_map(|buffer| {
-        if let Some(acquire) = &buffer.acquire {
-            bstart |= acquire.stages.start;
-            bend |= acquire.stages.end;
+    let barriers: Vec<gfx_hal::memory::Barrier<'_, B>> = buffers
+        .into_iter()
+        .filter_map(|buffer| {
+            if let Some(acquire) = &buffer.acquire {
+                bstart |= acquire.stages.start;
+                bend |= acquire.stages.end;
 
-            Some(gfx_hal::memory::Barrier::Buffer {
-                states: acquire.states.clone(),
-                families: acquire.families.clone(),
-                target: buffer.buffer.raw(),
-                range: Some(buffer.range.start) .. Some(buffer.range.end),
-            })
-        } else {
-            None
-        }
-    }).chain(images.into_iter().filter_map(|image| {
-        if let Some(acquire) = &image.acquire {
-            istart |= acquire.stages.start;
-            iend |= acquire.stages.end;
+                Some(gfx_hal::memory::Barrier::Buffer {
+                    states: acquire.states.clone(),
+                    families: acquire.families.clone(),
+                    target: buffer.buffer.raw(),
+                    range: Some(buffer.range.start)..Some(buffer.range.end),
+                })
+            } else {
+                None
+            }
+        })
+        .chain(images.into_iter().filter_map(|image| {
+            if let Some(acquire) = &image.acquire {
+                istart |= acquire.stages.start;
+                iend |= acquire.stages.end;
 
-            Some(gfx_hal::memory::Barrier::Image {
-                states: acquire.states.clone(),
-                families: acquire.families.clone(),
-                target: image.image.raw(),
-                range: image.range.clone(),
-            })
-        } else {
-            None
-        }
-    })).collect();
+                Some(gfx_hal::memory::Barrier::Image {
+                    states: acquire.states.clone(),
+                    families: acquire.families.clone(),
+                    target: image.image.raw(),
+                    range: image.range.clone(),
+                })
+            } else {
+                None
+            }
+        }))
+        .collect();
 
-    (bstart|istart .. bend|iend, barriers)
+    (bstart | istart..bend | iend, barriers)
 }
 
 /// Convert graph barriers into gfx barriers.
-pub fn gfx_release_barriers<'a, B: gfx_hal::Backend>(buffers: impl IntoIterator<Item = &'a NodeBuffer<'a, B>>, images: impl IntoIterator<Item = &'a NodeImage<'a, B>>) -> (std::ops::Range<gfx_hal::pso::PipelineStage>, Vec<gfx_hal::memory::Barrier<'a, B>>) {
+pub fn gfx_release_barriers<'a, B: gfx_hal::Backend>(
+    buffers: impl IntoIterator<Item = &'a NodeBuffer<'a, B>>,
+    images: impl IntoIterator<Item = &'a NodeImage<'a, B>>,
+) -> (
+    std::ops::Range<gfx_hal::pso::PipelineStage>,
+    Vec<gfx_hal::memory::Barrier<'a, B>>,
+) {
     let mut bstart = gfx_hal::pso::PipelineStage::empty();
     let mut bend = gfx_hal::pso::PipelineStage::empty();
 
     let mut istart = gfx_hal::pso::PipelineStage::empty();
     let mut iend = gfx_hal::pso::PipelineStage::empty();
 
-    let barriers: Vec<gfx_hal::memory::Barrier<'_, B>> = buffers.into_iter().filter_map(|buffer| {
-        if let Some(release) = &buffer.release {
-            bstart |= release.stages.start;
-            bend |= release.stages.end;
+    let barriers: Vec<gfx_hal::memory::Barrier<'_, B>> = buffers
+        .into_iter()
+        .filter_map(|buffer| {
+            if let Some(release) = &buffer.release {
+                bstart |= release.stages.start;
+                bend |= release.stages.end;
 
-            Some(gfx_hal::memory::Barrier::Buffer {
-                states: release.states.clone(),
-                families: release.families.clone(),
-                target: buffer.buffer.raw(),
-                range: Some(buffer.range.start) .. Some(buffer.range.end),
-            })
-        } else {
-            None
-        }
-    }).chain(images.into_iter().filter_map(|image| {
-        if let Some(release) = &image.release {
-            istart |= release.stages.start;
-            iend |= release.stages.end;
+                Some(gfx_hal::memory::Barrier::Buffer {
+                    states: release.states.clone(),
+                    families: release.families.clone(),
+                    target: buffer.buffer.raw(),
+                    range: Some(buffer.range.start)..Some(buffer.range.end),
+                })
+            } else {
+                None
+            }
+        })
+        .chain(images.into_iter().filter_map(|image| {
+            if let Some(release) = &image.release {
+                istart |= release.stages.start;
+                iend |= release.stages.end;
 
-            Some(gfx_hal::memory::Barrier::Image {
-                states: release.states.clone(),
-                families: release.families.clone(),
-                target: image.image.raw(),
-                range: image.range.clone(),
-            })
-        } else {
-            None
-        }
-    })).collect();
+                Some(gfx_hal::memory::Barrier::Image {
+                    states: release.states.clone(),
+                    families: release.families.clone(),
+                    target: image.image.raw(),
+                    range: image.range.clone(),
+                })
+            } else {
+                None
+            }
+        }))
+        .collect();
 
-    (bstart|istart .. bend|iend, barriers)
+    (bstart | istart..bend | iend, barriers)
 }

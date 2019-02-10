@@ -1,22 +1,16 @@
 //! This crate can derive synchronization required
 //! for the dependency chain of the whole execution graph.
 
-#![forbid(overflowing_literals)]
-#![deny(missing_copy_implementations)]
-#![deny(missing_debug_implementations)]
-#![deny(missing_docs)]
-#![deny(intra_doc_link_resolution_failure)]
-#![deny(path_statements)]
-#![deny(trivial_bounds)]
-#![deny(type_alias_bounds)]
-#![deny(unconditional_recursion)]
-#![deny(unions_with_drop_fields)]
-#![deny(while_true)]
-#![deny(unused)]
-#![deny(bad_style)]
-#![deny(future_incompatible)]
-#![deny(rust_2018_compatibility)]
-#![deny(rust_2018_idioms)]
+#[warn(
+    missing_debug_implementations,
+    missing_copy_implementations,
+    missing_docs,
+    trivial_casts,
+    trivial_numeric_casts,
+    unused_extern_crates,
+    unused_import_braces,
+    unused_qualifications
+)]
 
 /// Unique resource id.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,8 +26,8 @@ mod sync;
 pub use crate::{
     chain::{Chain, Link, LinkNode},
     collect::{collect, Chains, Unsynchronized},
-    node::{Node, State, BufferState, ImageState},
+    node::{BufferState, ImageState, Node, State},
     resource::{AccessFlags, Buffer, Image, Resource, UsageFlags},
     schedule::{Family, Queue, QueueId, Schedule, Submission, SubmissionId},
-    sync::{sync, SyncData, Barrier, Barriers, BufferBarriers, ImageBarriers, Guard, Wait, Signal},
+    sync::{sync, Barrier, Barriers, BufferBarriers, Guard, ImageBarriers, Signal, SyncData, Wait},
 };

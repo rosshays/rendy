@@ -11,9 +11,9 @@ metal = ["gfx-backend-metal"]
 vulkan = ["gfx-backend-vulkan"]
 
 [dependencies]
-rendy-resource = { path = "../resource" }
+rendy-resource = { version = "0.1.0", path = "../resource" }
 
-gfx-hal = "0.1.0"
+gfx-hal = "0.1"
 gfx-backend-empty = { version = "0.1.0", optional = true }
 gfx-backend-dx12 = { version = "0.1.0", optional = true }
 gfx-backend-metal = { version = "0.1.0", optional = true }
@@ -22,6 +22,6 @@ gfx-backend-vulkan = { version = "0.1.0", optional = true }
 derivative = "1.0"
 failure = "0.1"
 log = "0.4"
-relevant = "0.3"
+relevant = { version = "0.4", features = ["log", "backtrace"] }
 smallvec = "0.6"
 winit = "0.18"

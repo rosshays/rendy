@@ -12,14 +12,7 @@ use crate::{
     family::FamilyId,
 };
 
-pub use self::{
-    level::*,
-    reset::*,
-    state::*,
-    submit::*,
-    usage::*,
-    encoder::*,
-};
+pub use self::{encoder::*, level::*, reset::*, state::*, submit::*, usage::*};
 
 /// Command buffer wrapper.
 /// This wrapper defines state with usage, level and ability to be individually reset at type level.
@@ -47,7 +40,8 @@ where
     R: Send,
     FamilyId: Send,
     relevant::Relevant: Send,
-{}
+{
+}
 
 unsafe impl<B, C, S, L, R> Sync for CommandBuffer<B, C, S, L, R>
 where
@@ -59,7 +53,8 @@ where
     R: Sync,
     FamilyId: Sync,
     relevant::Relevant: Sync,
-{}
+{
+}
 
 impl<B, C, S, L, R> CommandBuffer<B, C, S, L, R>
 where
@@ -161,6 +156,75 @@ where
     }
 }
 
+/// Begin info for specific level and render pass relation.
+pub unsafe trait BeginInfo<'a, B: gfx_hal::Backend, L> {
+    /// Pass relation type.
+    type PassRelation: RenderPassRelation<L>;
+
+    /// Get command buffer inheritance info.
+    fn inheritance_info(self) -> gfx_hal::command::CommandBufferInheritanceInfo<'a, B>;
+}
+
+unsafe impl<'a, B, L> BeginInfo<'a, B, L> for ()
+where
+    B: gfx_hal::Backend,
+    L: Level,
+{
+    type PassRelation = OutsideRenderPass;
+
+    fn inheritance_info(self) -> gfx_hal::command::CommandBufferInheritanceInfo<'a, B> {
+        gfx_hal::command::CommandBufferInheritanceInfo::default()
+    }
+}
+
+unsafe impl<'a, B> BeginInfo<'a, B, SecondaryLevel> for gfx_hal::pass::Subpass<'a, B>
+where
+    B: gfx_hal::Backend,
+{
+    type PassRelation = RenderPassContinue;
+
+    fn inheritance_info(self) -> gfx_hal::command::CommandBufferInheritanceInfo<'a, B> {
+        gfx_hal::command::CommandBufferInheritanceInfo {
+            subpass: Some(self),
+            framebuffer: None,
+            ..gfx_hal::command::CommandBufferInheritanceInfo::default()
+        }
+    }
+}
+
+unsafe impl<'a, B, F> BeginInfo<'a, B, SecondaryLevel>
+    for (gfx_hal::pass::Subpass<'a, B>, Option<&'a F>)
+where
+    B: gfx_hal::Backend,
+    F: std::borrow::Borrow<B::Framebuffer>,
+{
+    type PassRelation = RenderPassContinue;
+
+    fn inheritance_info(self) -> gfx_hal::command::CommandBufferInheritanceInfo<'a, B> {
+        gfx_hal::command::CommandBufferInheritanceInfo {
+            subpass: Some(self.0),
+            framebuffer: self.1.map(F::borrow),
+            ..gfx_hal::command::CommandBufferInheritanceInfo::default()
+        }
+    }
+}
+
+unsafe impl<'a, B, F> BeginInfo<'a, B, SecondaryLevel> for (gfx_hal::pass::Subpass<'a, B>, &'a F)
+where
+    B: gfx_hal::Backend,
+    F: std::borrow::Borrow<B::Framebuffer>,
+{
+    type PassRelation = RenderPassContinue;
+
+    fn inheritance_info(self) -> gfx_hal::command::CommandBufferInheritanceInfo<'a, B> {
+        gfx_hal::command::CommandBufferInheritanceInfo {
+            subpass: Some(self.0),
+            framebuffer: Some(self.1.borrow()),
+            ..gfx_hal::command::CommandBufferInheritanceInfo::default()
+        }
+    }
+}
+
 impl<B, C, L, R> CommandBuffer<B, C, InitialState, L, R>
 where
     B: gfx_hal::Backend,
@@ -170,23 +234,24 @@ where
     /// # Parameters
     ///
     /// `usage` - specifies usage of the command buffer. Possible types are `OneShot`, `MultiShot`.
-    pub fn begin<U, P>(
+    pub fn begin<'a, U, P>(
         mut self,
+        usage: U,
+        info: impl BeginInfo<'a, B, L, PassRelation = P>,
     ) -> CommandBuffer<B, C, RecordingState<U, P>, L, R>
     where
         U: Usage,
         P: RenderPassRelation<L>,
     {
-        let usage = U::default();
-        let pass_continue = P::default();
+        let pass_relation = P::default();
         unsafe {
             gfx_hal::command::RawCommandBuffer::begin(
                 self.raw(),
-                usage.flags() | pass_continue.flags(),
-                gfx_hal::command::CommandBufferInheritanceInfo::default(),
+                usage.flags() | pass_relation.flags(),
+                info.inheritance_info(),
             );
 
-            self.change_state(|_| RecordingState(usage, pass_continue))
+            self.change_state(|_| RecordingState(usage, pass_relation))
         }
     }
 }
@@ -198,9 +263,7 @@ where
     /// Finish recording command buffer.
     pub fn finish(mut self) -> CommandBuffer<B, C, ExecutableState<U, P>, L, R> {
         unsafe {
-            gfx_hal::command::RawCommandBuffer::finish(
-                self.raw(),
-            );
+            gfx_hal::command::RawCommandBuffer::finish(self.raw());
 
             self.change_state(|s| ExecutableState(s.0, s.1))
         }
@@ -216,11 +279,11 @@ where
     /// # Safety
     ///
     /// None of [`Submit`] instances created from this `CommandBuffer` are alive.
-    /// 
+    ///
     /// If this is `PrimaryLevel` buffer then
     /// for each command queue where [`Submit`] instance (created from this `CommandBuffer`)
     /// was submitted at least one [`Fence`] submitted within same `Submission` or later in unset state was `set`.
-    /// 
+    ///
     /// If this is `Secondary` buffer then
     /// all primary command buffers where [`Submit`] instance (created from this `CommandBuffer`)
     /// was submitted must be complete.
@@ -271,6 +334,7 @@ where
     /// Dispose of command buffer wrapper releasing raw comman buffer value.
     /// This function is intended to be used to deallocate command buffer.
     pub fn into_raw(self) -> B::CommandBuffer {
+        self.relevant.dispose();
         unsafe {
             // state guarantees that raw command buffer is not shared.
             *Box::from_raw(self.raw.as_ptr())

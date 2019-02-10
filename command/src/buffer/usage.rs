@@ -1,5 +1,4 @@
-
-use super::{SecondaryLevel};
+use super::SecondaryLevel;
 
 /// Command buffer with this usage flag will move to invalid state after execution.
 /// Resubmitting will require reset and rerecording commands.
@@ -65,7 +64,7 @@ impl Usage for NoSimultaneousUse {
 
 /// Trait implemented for type-level render pass relation flags.
 /// `RenderPassContinue` and `OutsideRenderPass`.
-pub trait RenderPassRelation<L>: Copy + Default + std::fmt::Debug {
+pub trait RenderPassRelation<L>: Copy + Default + std::fmt::Debug + 'static {
     /// Flags required to begin command buffer.
     fn flags(&self) -> gfx_hal::command::CommandBufferFlags;
 }
